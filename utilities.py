@@ -48,3 +48,16 @@ def get_metadata(ept_path):
 
     
     return (bounds, has_normal)
+
+
+
+
+    
+    
+    
+    
+    
+    
+    
+    
+    

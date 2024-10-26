@@ -24,7 +24,8 @@ from scipy.spatial import KDTree
 
 class icp_configs:
     def __init__(self, conf):
-        self.bounds              = conf.get('bounds') 
+        self.bounds              = conf.get('bounds')
+        self.classes             = conf.get('classes')
         self.window_size         = conf.get('window_size')
         self.step_size           = conf.get('step_size')
         self.threshold           = conf.get('threshold')
@@ -36,6 +37,7 @@ class icp_configs:
         self.outlier_percent     = conf.get('outlier_percent') #However, we will keep 95% of the points.
         self.method              = conf.get('method')
         self.has_normal_post     = conf.get('has_normal_post')
+        self.null                = conf.get('null')
         self.output_basename     = conf.get('output_basename')
 
         
@@ -134,7 +136,8 @@ def run_transicp(pre_event, pos_event, config):
         null = config.null
         Tconverge = config.Tconverge
         Tmax_iter = config.Tmax_iter
-        calc_normal = config.has_normal_post
+        calc_normal = not config.has_normal_post
+        classes = config.classes
         
         
         # Variables to hold the ICP vector origins (X, Y) and displacements (dx, dy)
@@ -143,65 +146,75 @@ def run_transicp(pre_event, pos_event, config):
         DX, DY, DZ = [], [], []
         RMSE, fitn = [], []
     
-        B = config.bounds
-
-    for y in range(bounds[2], bounds[3], step_size):
+    
+    total_y_steps = ((bounds[3] - bounds[2]) // step_size) + 1
+    
+    for i, y in enumerate(range(bounds[2], bounds[3], step_size)):
         dxr, dyr, dzr = [], [], []
         for x in range(bounds[0], bounds[1], step_size):
             
-            Xa, Na = get_pos_event(pos_event, x, y, margin, window_size, calc_normal)
-            Xb = get_pre_event(pre_event, x, y, window_size)
+            Xa, Na = get_pos_event(pos_event, x, y, margin, window_size, calc_normal, classes)
+            Xb = get_pre_event(pre_event, x, y, window_size, classes)
 
             
-                
+            if (Xa is None) or (Xb is None):
+                dxr.append(null)
+                dyr.append(null)
+                dzr.append(null)
+                continue
             if ((len(Xa) < config.min_points) | (len(Xb) < config.min_points)):
                 dxr.append(null)
                 dyr.append(null)
                 dzr.append(null)
                 continue
-                
-                res1, rmse, Max = transicp(Xb, Xa, Na, Tconverge, Tmax_iter)
-                
-                 
-        
-                dx.append(res1[0])
-                dy.append(res1[1])
-                dz.append(res1[2])
-                dxr.append(res1[0])
-                dyr.append(res1[1])
-                dzr.append(res1[2])
-                
-                # RMSE.append(rmse)
-                # fitn.append(registration_icp.fitness)
-        
-                X.append(x + window_size/2)
-                Y.append(y + window_size/2)
+            
+            
+            res1, rmse, Max = transicp(Xb, Xa, Na, Tconverge, Tmax_iter)
+            dx.append(res1[0])
+            dy.append(res1[1])
+            dz.append(res1[2])
+            dxr.append(res1[0])
+            dyr.append(res1[1])
+            dzr.append(res1[2])
+            
+            # RMSE.append(rmse)
+            # fitn.append(registration_icp.fitness)
+    
+            X.append(x + window_size/2)
+            Y.append(y + window_size/2)
                 
                 
-            DX.append(dxr)
-            DY.append(dyr)
-            DZ.append(dzr)
-            print('{}% done'.format(np.ceil(y / (B[3] - B[2]) * 100)))
+        DX.append(dxr)
+        DY.append(dyr)
+        DZ.append(dzr)
+        progress = ((i + 1) / total_y_steps) * 100
+        print('{:.2f}% done'.format(progress))
     
     
     
-        res = np.stack([X, Y, dx, dy, dz], axis = 1)
-        sname = '{0}_{1}_{2}.txt'.format(config.output_basename, window_size, step_size)
-        np.savetxt(sname, res, delimiter=' ', fmt='%.3f')
-        return res, np.stack([DX, DY, DZ], axis = 2)
+    res = np.stack([X, Y, dx, dy, dz], axis = 1)
+    sname = '{0}_{1}_{2}.txt'.format(config.output_basename, window_size, step_size)
+    np.savetxt(sname, res, delimiter=' ', fmt='%.3f')
+    return res, np.stack([DX, DY, DZ], axis = 2)
     
     
  
     
 
-def get_pos_event(pos_event, x, y, margin, window_size, calc_normal):
+def get_pos_event(pos_event, x, y, margin, window_size, calc_normal, cl):
     
+    C = ['Classification[{}:{}]'.format(c, c) for c in cl]
+    classes = ','.join(C)
     if calc_normal:
         pipeline = [
             {
                 'type':'readers.ept',
                 'filename':pos_event,
                 'bounds':'([{},{}],[{},{}])'.format(x - margin, x + window_size + margin, y - margin, y + window_size + margin)
+            },
+            {
+                "type":"filters.range",
+                "limits":classes
             },
             {
                 "type": "filters.normal",  # Compute normals if missing
@@ -219,30 +232,43 @@ def get_pos_event(pos_event, x, y, margin, window_size, calc_normal):
         ]
 
 
-
-    p = pdal.Pipeline(json.dumps(pipeline))
-    p.execute()
+    P = pdal.Pipeline(json.dumps(pipeline))
+    P.execute()
     
-    XYZ = np.stack([p[0]['X'], p[0]['Y'], p[0]['Z']], axis = 1)
-    N   = np.stack([p[0]['NormalX'], p[0]['NormalY'], p[0]['NormalZ']], axis = 1)
-        
-    return XYZ, N
+    try:
+        p = P.arrays[0]
+        XYZ = np.stack([p['X'], p['Y'], p['Z']], axis = 1)
+        N   = np.stack([p['NormalX'], p['NormalY'], p['NormalZ']], axis = 1)
+        return XYZ, N
+    except:
+        return None, None
 
 
 
 
-def get_pre_event(pre_event, x, y, window_size):
+def get_pre_event(pre_event, x, y, window_size, cl):
+    C = ['Classification[{}:{}]'.format(c, c) for c in cl]
+    classes = ','.join(C)
+    
     pipeline = [
         {
             'type':'readers.ept',
             'filename':pre_event,
             'bounds':'([{},{}],[{},{}])'.format(x, x + window_size, y, y + window_size)
+        },
+        {
+            "type":"filters.range",
+            "limits":classes
         }
     ]
 
-    p = pdal.Pipeline(json.dumps(pipeline))
-    p.execute()    
-    return np.stack([p[0]['X'], p[0]['Y'], p[0]['Z']], axis = 1)
+    P = pdal.Pipeline(json.dumps(pipeline))
+    P.execute()
+    try:
+        p = P.arrays[0]
+        return np.stack([p['X'], p['Y'], p['Z']], axis = 1)
+    except:
+        return None
 
 
 
