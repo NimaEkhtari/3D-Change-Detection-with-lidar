@@ -4,7 +4,7 @@ Created on Thu Oct 24 14:56:16 2024
 
 @author: nekhtari
 """
-
+import time
 import numpy as np
 import pdal
 import json
@@ -16,9 +16,11 @@ import numpy.ma as ma
 
 operation = 'ticp'
 # Path to pre- and post-event indexed point clouds (EPT)
-pre_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20240906\ModelKey\ept.json'
-pos_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20241018\ModelKey\ept.json'
+# pre_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20240906\ModelKey\ept.json'
+# pos_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20241018\ModelKey\ept.json'
 
+pre_event = r'D:\Working\SCE\Landslide\Data\LAZ_Classified\Klondike_LAS_20240925_ModelKey_Bldgs_V2.laz'
+pos_event = r'D:\Working\SCE\Landslide\Data\LAZ_Classified\Klondike_LAS_20241018_ModelKey_Bldgs_V2.laz'
 
 bounds_pre, has_normals_pre = utilities.get_metadata(pre_event)
 bounds_pos, has_normals_pos = utilities.get_metadata(pos_event)
@@ -32,12 +34,12 @@ bounds.append(int(max(bounds_pre[3], bounds_pos[3])))
 
 
 operation = 'translation_only'
-classes = [8]
+classes = [6, 8]
 
 # bounds = [6451884, 6452800, 1726600, 1727600]
 # has_normals_pos = False
 
-
+start_time = time.time()
 
 
 if operation == 'translation_only':
@@ -47,42 +49,43 @@ if operation == 'translation_only':
     'method' : 'translation_only',
     'threshold' : 20,
     'window_size' : 150,
-    'step_size' : 50,
+    'step_size' : 25,
     'margin': 15,
-    'min_points' : 500,
+    'min_points' : 200,
     'Tconverge' : 0.0005,
     'Tmax_iter' : 20,
-    'outlier_multiplier' : 5,
-    'outlier_percent' : 0.95,
+    'outlier_threshold': 3,
     'has_normal_post' : has_normals_pos,
     'null': -99,
-    'output_basename' : 'trans_icp_results'
+    'output_basename' : 'trans_icp_results_0925_1018'
     }
 
     config = icp.icp_configs(configs)
-    res, disp = icp.run_transicp(pre_event, pos_event, config)
+    res, disp = icp.run_transicp_parallel(pre_event, pos_event, config)
 
-
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Elapsed time: {elapsed_time:.2f} seconds")
 
 ''' ------------------------------------------------------------------------------------- '''
 '''                          Plotting -------------- '''
 
-# Calculate the length of each displacement vector
-d = np.linalg.norm(res[:, 2:4], axis=1)
+# # Calculate the length of each displacement vector
+# d = np.linalg.norm(res[:, 2:4], axis=1)
 
-# Filter out displacements longer than 1 meter
-mask = d <= 2.0
-filtered_X = res[mask, 0]
-filtered_Y = res[mask, 1]
-filtered_delta_X = res[mask, 2]
-filtered_delta_Y = res[mask, 3]
+# # Filter out displacements longer than 1 meter
+# mask = d <= 2.0
+# filtered_X = res[mask, 0]
+# filtered_Y = res[mask, 1]
+# filtered_delta_X = res[mask, 2]
+# filtered_delta_Y = res[mask, 3]
 
-# Plot the ICP vectors
-plt.figure()
-plt.quiver(filtered_X, filtered_Y, filtered_delta_X, filtered_delta_Y, angles='xy',
-           scale_units='xy', headwidth=2.5, headlength=4)
-plt.axis('equal')
-plt.show()
+# # Plot the ICP vectors
+# plt.figure()
+# plt.quiver(filtered_X, filtered_Y, filtered_delta_X, filtered_delta_Y, angles='xy',
+#            scale_units='xy', headwidth=2.5, headlength=4)
+# plt.axis('equal')
+# plt.show()
 
 
 
@@ -145,7 +148,7 @@ def plot_all(res, disp, Th):
     plt.show()
 
 
-plot_all(res, disp, 2)
+plot_all(res, disp, 3)
 
 
 
@@ -185,7 +188,8 @@ def write_disp_rasters(disp, output_file, transform, crs="EPSG:6424"):
 
 transform = from_origin(min(res[:, 0]), max(res[:, 1]), configs['step_size'], configs['step_size'])  # Replace with your actual top-left coordinates and pixel size
 
-write_disp_rasters(np.flipud(disp), "displacement_layers_ticp_150_50.tif", transform)
+filename = f'{configs['output_basename']}_{configs['window_size']}_{configs['step_size']}.tif'
+write_disp_rasters(np.flipud(disp), filename, transform)
 
 
 

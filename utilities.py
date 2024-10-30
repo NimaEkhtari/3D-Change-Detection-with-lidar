@@ -10,12 +10,17 @@ import pdal
 
 
 
-def get_metadata(ept_path):
+def get_metadata(file):
+    if file.endswith('json'):
+        reader = 'readers.ept'
+    elif file.endswith('laz'):
+        reader = 'readers.las'
+    
     pipeline = {
         "pipeline": [
             {
-                "type": "readers.ept",
-                "filename": ept_path
+                "type": reader,
+                "filename": file
             },
             {
                 "type":"filters.decimation",

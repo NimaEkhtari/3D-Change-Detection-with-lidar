@@ -9,8 +9,8 @@ import rasterio
 import numpy as np
 
 # Specify the input and output file paths
-input_file = 'displacement_layers_ticp_150_50.tif'
-output_file = 'displacement_layers_ticp_150_50_2.tif'
+input_file = 'trans_icp_results_0925_1018_1_150_50.tif'
+output_file = 'trans_icp_results_0925_1018_1_150_50_norm.tif'
 
 # Define the values you want to drop for each layer
 drop_values = [0.194423167, -0.4835325,	-0.389634667]  # Replace with the specific values for each layer
