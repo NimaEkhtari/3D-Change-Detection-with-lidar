@@ -182,7 +182,7 @@ def extract_tile(x, y, tile_size, margin, B, A, N):
 
 
 def run_transicp_parallel(pre_event, pos_event, config):
-    cpu_cores = os.cpu_count() * 20 # Use actual core count
+    cpu_cores = os.cpu_count() * 1 # Use actual core count
 
     if config.method == 'translation_only':
         # ICP window and step sizes
@@ -218,15 +218,31 @@ def run_transicp_parallel(pre_event, pos_event, config):
     # Loop over processes and prepare tiles in parallel
     for i in range(n_batches):
         block_indices = range(i * cpu_cores, min((i + 1) * cpu_cores, total_steps))
-        blocks = []
+        blocks1 = []
 
         # Parallel extraction of tiles
+        Jdx = []
         with ThreadPoolExecutor() as executor:
-            future_blocks = {executor.submit(extract_tile, x[j], y[j], step_size, margin, B, A, N): j for j in block_indices}
+            future_blocks = {executor.submit(extract_tile, x[j], y[j], step_size, margin, B, A, N): jdx for jdx, j in enumerate(block_indices)}
             for future in as_completed(future_blocks):
+                # Jdx.append(jdx)
                 j = future_blocks[future]
-                Xb, Xa, Na = future.result()
-                blocks.append([Xb, Xa, Na, config, x[j], y[j]])
+                try:
+                    Xb, Xa, Na = future.result()
+                    Jdx.append(j)
+                    blocks1.append([Xb, Xa, Na, config, x[block_indices[j]], y[block_indices[j]]])
+                except Exception as e:
+                    print(f"Error processing block {j}: {e}")
+                # Jdx.append(j)
+                # Xb, Xa, Na = future.result()
+                # blocks1.append([Xb, Xa, Na, config, x[block_indices[j]], y[block_indices[j]]])
+                
+        # Initialize an empty list to hold the original order
+        blocks = [None] * len(blocks1)
+        # Place each element back at its original position
+        for new_index, original_index in enumerate(Jdx):
+            blocks[original_index] = blocks1[new_index]
+
 
         # Process each block with transicp in parallel
         results = [None] * len(blocks)
