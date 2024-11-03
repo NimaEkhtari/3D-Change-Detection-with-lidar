@@ -19,8 +19,8 @@ operation = 'ticp'
 # pre_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20240906\ModelKey\ept.json'
 # pos_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20241018\ModelKey\ept.json'
 
-pre_event = r'D:\SCE\Data\LAZ_Classified\Klondike_LAS_20240925_ModelKey_Bldgs_V2.laz'
-pos_event = r'D:\SCE\Data\LAZ_Classified\Klondike_LAS_20241018_ModelKey_Bldgs_V2.laz'
+pre_event = r'D:\Working\SCE\Landslide\Data\LAZ_Classified\Klondike_LAS_20240906_ModelKey_Bldgs_V2.laz'
+pos_event = r'D:\Working\SCE\Landslide\Data\LAZ_Classified\Klondike_LAS_20240925_ModelKey_Bldgs_V2.laz'
 
 bounds_pre, has_normals_pre = utilities.get_metadata(pre_event)
 bounds_pos, has_normals_pos = utilities.get_metadata(pos_event)
@@ -57,7 +57,7 @@ if operation == 'translation_only':
     'outlier_threshold': 3,
     'has_normal_post' : has_normals_pos,
     'null': -99,
-    'output_basename' : 'trans_icp_results_0925_1018'
+    'output_basename' : 'trans_icp_results_0906_0925¥'
     }
 
     config = icp.icp_configs(configs)
