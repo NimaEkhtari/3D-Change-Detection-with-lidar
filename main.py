@@ -19,8 +19,8 @@ operation = 'ticp'
 # pre_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20240906\ModelKey\ept.json'
 # pos_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20241018\ModelKey\ept.json'
 
-pre_event = r'D:\Working\SCE\Landslide\Data\LAZ_Classified\Klondike_LAS_20240906_ModelKey_Bldgs_V2.laz'
-pos_event = r'D:\Working\SCE\Landslide\Data\LAZ_Classified\Klondike_LAS_20240925_ModelKey_Bldgs_V2.laz'
+pre_event = r'D:\Working\SCE\Landslide\Data\RollingHills\Data\RH_1018_combined.laz'
+pos_event = r'D:\Working\SCE\Landslide\Data\RollingHills\Data\RH_1023_combined.laz'
 
 bounds_pre, has_normals_pre = utilities.get_metadata(pre_event)
 bounds_pos, has_normals_pos = utilities.get_metadata(pos_event)

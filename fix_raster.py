@@ -9,13 +9,13 @@ import rasterio
 import numpy as np
 
 # Specify the input file path
-input_file = 'trans_icp_results_0925_1018_150_25.tif'
+input_file = 'test2__150_25.tif'
 const = 'norm'
 
 # Define the values you want to drop for each layer
-# drop_values = [-0.219395167,-0.064641833,-0.386200167]  # For 0906-0925
+drop_values = [-0.219395167,-0.064641833,-0.386200167]  # For 0906-0925
 # drop_values = [0.194423167, -0.4835325, -0.389634667]  # For 0906-1018
-drop_values = [0.274856,	-0.4731875,	-0.065748167]  # For 0925-1018
+# drop_values = [0.274856,	-0.4731875,	-0.065748167]  # For 0925-1018
 
 # Open the input GeoTIFF file
 with rasterio.open(input_file) as src:
