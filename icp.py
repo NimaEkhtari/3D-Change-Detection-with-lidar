@@ -3,754 +3,275 @@
 Created on Thu Oct 24 14:54:35 2024
 
 @author: nekhtari
+
+Translation-only ICP (TICP) applied in a moving window over two lidar point
+clouds. For every window we solve for a single 3D shift (dx, dy, dz) that best
+aligns the pre-event points to the post-event surface using point-to-plane ICP.
+No rotation is estimated because both clouds are already georeferenced.
+
+The processing is done on the CPU. Columns of windows are distributed over
+several processes and the point clouds are placed in shared memory, so each
+process can cut its own tiles without copying the full clouds around.
 """
 
 import os
+import time
 import numpy as np
-# import faiss
-import pdal
-import json
-import argparse
-import math
-import utilities
+from dataclasses import dataclass
 from scipy.spatial import KDTree
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import shared_memory
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 
-''' ********************************************************************** '''
-''' ********************************************************************** '''
-''' ********************************************************************** '''
-''' ********************************************************************** '''
-
-class icp_configs:
-    def __init__(self, conf):
-        self.bounds              = conf.get('bounds')
-        self.classes             = conf.get('classes')
-        self.window_size         = conf.get('window_size')
-        self.step_size           = conf.get('step_size')
-        self.threshold           = conf.get('threshold')
-        self.margin              = conf.get('margin')
-        self.min_points          = conf.get('min_points')
-        self.Tconverge           = conf.get('Tconverge')
-        self.Tmax_iter           = conf.get('Tmax_iter')
-        self.outlier_threshold   = conf.get('outlier_threshold') #points larger than this many times the RMSE removed
-        self.method              = conf.get('method')
-        self.has_normal_post     = conf.get('has_normal_post')
-        self.null                = conf.get('null')
-        self.output_basename     = conf.get('output_basename')
-
-        
+@dataclass
+class ICPConfig:
+    window_size: float = 150          # size of the square ICP window (point cloud units)
+    step_size: float = 25             # distance between window centers = output pixel size
+    margin: float = 3                 # buffer added around the post-event (fixed) window
+    classes: list = None              # LAS classes to use, e.g. [2] for ground. None = all points
+    min_points: int = 20              # windows with fewer points than this are skipped
+    convergence: float = 0.0005       # stop when every component of the update is below this
+    max_iter: int = 20                # maximum number of ICP iterations per window
+    outlier_threshold: float = 3      # residuals larger than this many MADs are rejected
+    normal_knn: int = 8               # neighbours used to estimate the post-event normals
+    bounds: list = None               # [xmin, xmax, ymin, ymax]. None = overlap of the two clouds
+    n_workers: int = None             # number of processes. None = all cores but one, 1 = no multiprocessing
+    crs: str = None                   # e.g. 'EPSG:6424'. None = read from the point cloud
 
 
-def transicp(moving, fixed, fixed_normal, config, x, y):
+
+def transicp(moving, fixed, fixed_normal, config):
     '''
+    Point-to-plane ICP that only solves for a translation.
+
     Parameters
     ----------
     moving : numpy array of size m x 3
-        3D coordinates of moving point cloud points.
+        3D coordinates of the moving (pre-event) points.
     fixed : numpy array of size n x 3
-        3D coordinates of fixed point cloud points.
+        3D coordinates of the fixed (post-event) points.
     fixed_normal : numpy array of size n x 3
-        3D normal vector associated to local plane fitted to point in the fixed point cloud.
-    Tconverge : scalar value
-        ICP convergence threshold.
-    Tmax_iter : integer value
-        Maximum number of iterations of the ICP algorithm.
-    outlier_threshold : scalar
-        Threshold for outlier removal based on median absolute deviation (MAD).
+        Unit normal of the local plane at every fixed point.
+    config : ICPConfig
+        Uses min_points, convergence, max_iter and outlier_threshold.
 
     Returns
     -------
-    icp_trans : list
-        Estimated 3D shift vector.
+    icp_trans : numpy array of size 3
+        Estimated shift [dx, dy, dz] that moves the moving points onto the fixed
+        surface. NaN if the window could not be solved.
     RMSE : scalar
-        RMSE of the ICP algorithm.
-    Max : scalar
-        Maximum value of residual.
-
+        Point-to-plane RMSE of the inliers after the last iteration.
+    n_inliers : integer
+        Number of points used in the last iteration.
     '''
-    null = config.null
-    Tconverge = config.Tconverge
-    Tmax_iter = config.Tmax_iter
-    min_points = config.min_points
-    outlier_threshold = config.outlier_threshold
-    
-    
-    if (fixed is None) or (moving is None):
-        return [null, null, null], null, null, x, y
-    
-    if ((len(fixed) < min_points) | (len(moving) < min_points)):
-        return [null, null, null], null, null, x, y
-    
-    
-    loop = True
-    icp_trans = np.array([0, 0, 0])
-    count = 0
-    
-    # Center the point clouds
+    failed = np.array([np.nan, np.nan, np.nan]), np.nan, 0
+
+    if len(fixed) < config.min_points or len(moving) < config.min_points:
+        return failed
+
+    # Center the point clouds (large projected coordinates hurt the precision)
     means = np.mean(fixed, axis=0)
     X1 = moving - means
     X2 = fixed - means
-       
-    kdtree = KDTree(X2)
-    flag = False
-    while loop:
-        # Point indexing setup, updated each iteration
-        search_pts = X1 + icp_trans
-        D, I = kdtree.query(search_pts, k=1)
-        
-        Normal = fixed_normal[I, :]
-        Vec_Diff = (search_pts - X2[I, :])
-        misc = np.sum(Vec_Diff * Normal, axis=1)
 
-        # Outlier removal based on residuals
+    kdtree = KDTree(X2)
+    icp_trans = np.zeros(3)
+
+    for count in range(config.max_iter):
+        search_pts = X1 + icp_trans
+        _, I = kdtree.query(search_pts, k=1)
+
+        Normal = fixed_normal[I, :]
+        misc = np.sum((search_pts - X2[I, :]) * Normal, axis=1)
+
+        # Outlier removal based on median absolute deviation of the residuals
         median_residual = np.median(misc)
         mad = np.median(np.abs(misc - median_residual))
-        inlier_mask = np.abs(misc - median_residual) < outlier_threshold * mad
+        inlier_mask = np.abs(misc - median_residual) < config.outlier_threshold * mad
+        if np.count_nonzero(inlier_mask) < config.min_points:
+            return failed
 
-        # Only use inliers for ICP updates
+        # Least squares update using the inliers only
         A = Normal[inlier_mask]
-        misc_inliers = misc[inlier_mask]
-
-        AT = A.transpose()
-        ATA = AT.dot(A)
-        
-        # Attempt inversion and handle potential singular matrix
         try:
-            N = np.linalg.inv(ATA)
-            U = AT.dot(misc_inliers)
-            delcap = -N.dot(U)
-            
-            icp_trans = icp_trans + delcap
-            
-            count += 1
-            if np.all(np.abs(delcap) < Tconverge) or count > Tmax_iter:
-                loop = False
-                
+            delcap = -np.linalg.solve(A.T @ A, A.T @ misc[inlier_mask])
         except np.linalg.LinAlgError:
-            flag = True
-            print("Singular matrix encountered during inversion. Exiting loop with NaN values.")
-            icp_trans = np.array([np.nan, np.nan, np.nan])
-            RMSE = np.nan
-            Max = np.nan
-            break  # Exit the loop
-            
+            return failed
 
-    if not flag:
-        # Compute final RMSE for inliers
-        Vec_Diff2 = (search_pts[inlier_mask] - X2[I[inlier_mask]])
-        resi = np.sum(Vec_Diff2 * Normal[inlier_mask], axis=1)
-        wsquared = np.sum(resi ** 2)
-        RMSE = math.sqrt(wsquared / len(Vec_Diff2))
-        Max = np.amax(np.abs(misc))
+        icp_trans = icp_trans + delcap
+        if np.all(np.abs(delcap) < config.convergence):
+            break
 
-    return icp_trans, RMSE, Max, x, y
+    # Final RMSE for the inliers, after applying the last update
+    resi = misc[inlier_mask] + A @ delcap
+    RMSE = np.sqrt(np.mean(resi ** 2))
+
+    return icp_trans, RMSE, len(resi)
 
 
 
+''' ---------------------------------------------------------------------- '''
+'''   Moving window                                                         '''
+''' ---------------------------------------------------------------------- '''
 
-def extract_tile(x, y, tile_size, margin, B, A, N):
+# Every worker process keeps the point clouds and the grid here. In the main
+# process (n_workers = 1) the same dictionary is filled directly.
+_data = {}
+
+
+def _set_data(before, after, normals, xs, ys, config):
+    _data.update(before=before, after=after, normals=normals, xs=xs, ys=ys, config=config)
+
+
+
+def _init_worker(specs, xs, ys, config):
+    arrays = {}
+    for name, (shm_name, shape, dtype) in specs.items():
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name, track=False)   # python >= 3.13
+        except TypeError:
+            shm = shared_memory.SharedMemory(name=shm_name)
+        _data['shm_' + name] = shm        # keep a reference, otherwise the buffer gets closed
+        arrays[name] = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    _set_data(arrays['before'], arrays['after'], arrays['normals'], xs, ys, config)
+
+
+
+def process_column(col):
     """
-    Extracts a tile from a matrix M of 3D coordinates with a margin around it.
-    
-    Parameters:
-    - x, y: Bottom-right corner of the tile (smallest x and y coordinates of the tile).
-    - tile_size: Size of the tile in units.
-    - margin: Additional margin to add around the tile.
-    - M: Numpy array of shape (1000, 3) representing 3D coordinates (x, y, z).
-    
-    Returns:
-    - A numpy array of points within the specified tile and margin.
+    Runs TICP for every window in one column of the grid. The clouds are sorted
+    by X, so the column is cut with a binary search and each window inside the
+    column only needs a mask on Y.
     """
-    
-    # Define boundaries for filtering
-    x_min = x - margin
-    x_max = x + tile_size + margin
-    y_min = y - margin
-    y_max = y + tile_size + margin
-    
-    # Apply logical indexing to select points within the boundary
-    b = B[(B[:, 0] >= x_min) & (B[:, 0] <= x_max) & (B[:, 1] >= y_min) & (B[:, 1] <= y_max)]
-    mask = (A[:, 0] >= x_min) & (A[:, 0] <= x_max) & (A[:, 1] >= y_min) & (A[:, 1] <= y_max)
-    a = A[mask]
-    n = N[mask]
-    
-    return b, a, n
+    before, after, normals = _data['before'], _data['after'], _data['normals']
+    ys, config = _data['ys'], _data['config']
+    w, m = config.window_size, config.margin
+    x = _data['xs'][col]
+
+    # Pre-event (moving) points: the window itself
+    lo, hi = np.searchsorted(before[:, 0], [x, x + w])
+    pb = before[lo:hi]
+    # Post-event (fixed) points: the window plus a margin, so the moving points
+    # still find their neighbours after they are shifted
+    lo, hi = np.searchsorted(after[:, 0], [x - m, x + w + m])
+    pa = after[lo:hi]
+    pn = normals[lo:hi]
+
+    out = []
+    for row, y in enumerate(ys):
+        mask_b = (pb[:, 1] >= y) & (pb[:, 1] < y + w)
+        mask_a = (pa[:, 1] >= y - m) & (pa[:, 1] < y + w + m)
+        shift, rmse, n = transicp(pb[mask_b], pa[mask_a], pn[mask_a], config)
+        out.append((row, col, shift[0], shift[1], shift[2], rmse, n))
+    return out
 
 
 
-
-def run_transicp_parallel(pre_event, pos_event, config):
-    cpu_cores = os.cpu_count() * 1 # Use actual core count
-
-    if config.method == 'translation_only':
-        # ICP window and step sizes
-        window_size = config.window_size
-        step_size = config.step_size
-        margin = config.margin
-        bounds = config.bounds
-
-        calc_normal = not config.has_normal_post
-        classes = config.classes
-
-        # Variables to hold ICP vector origins and displacements
-        X, Y = [], []
-        dx, dy, dz = [], [], []
-        DX, DY, DZ = [], [], []
-        dxr, dyr, dzr = [], [], []
-
-    # Load point cloud data
-    A, N = get_ept_file(pos_event, get_normal=True, calc_normal=calc_normal, cl=classes)
-    B = get_ept_file(pre_event, get_normal=False, calc_normal=calc_normal, cl=classes)
-    
-    # Generate coordinate grid
-    x_min, x_max, y_min, y_max = bounds
-    xx = np.arange(x_min, x_max, step_size)
-    yy = np.arange(y_min, y_max, step_size)
-    llx, lly = np.meshgrid(xx, yy)
-    x = llx.ravel()
-    y = lly.ravel()
-    
-    total_steps = len(x)
-    n_batches = int(np.ceil(total_steps / cpu_cores))
-
-    # Loop over processes and prepare tiles in parallel
-    for i in range(n_batches):
-        block_indices = range(i * cpu_cores, min((i + 1) * cpu_cores, total_steps))
-        blocks1 = []
-
-        # Parallel extraction of tiles
-        Jdx = []
-        with ThreadPoolExecutor() as executor:
-            future_blocks = {executor.submit(extract_tile, x[j], y[j], step_size, margin, B, A, N): jdx for jdx, j in enumerate(block_indices)}
-            for future in as_completed(future_blocks):
-                # Jdx.append(jdx)
-                j = future_blocks[future]
-                try:
-                    Xb, Xa, Na = future.result()
-                    Jdx.append(j)
-                    blocks1.append([Xb, Xa, Na, config, x[block_indices[j]], y[block_indices[j]]])
-                except Exception as e:
-                    print(f"Error processing block {j}: {e}")
-                # Jdx.append(j)
-                # Xb, Xa, Na = future.result()
-                # blocks1.append([Xb, Xa, Na, config, x[block_indices[j]], y[block_indices[j]]])
-                
-        # Initialize an empty list to hold the original order
-        blocks = [None] * len(blocks1)
-        # Place each element back at its original position
-        for new_index, original_index in enumerate(Jdx):
-            blocks[original_index] = blocks1[new_index]
-
-
-        # Process each block with transicp in parallel
-        results = [None] * len(blocks)
-        with ThreadPoolExecutor() as executor:
-            futures = {executor.submit(transicp, *block): idx for idx, block in enumerate(blocks)}
-            for future in as_completed(futures):
-                idx = futures[future]
-                results[idx] = future.result()  # Place each result in the correct index
-
-            # Store results from transicp
-            for res in results:
-                dx.append(res[0][0])
-                dy.append(res[0][1])
-                dz.append(res[0][2])
-                dxr.append(res[0][0])
-                dyr.append(res[0][1])
-                dzr.append(res[0][2])
-                X.append(res[3] + window_size / 2)
-                Y.append(res[4] + window_size / 2)
-
-                if len(X) % len(xx) == 0:  # Per row completion
-                    DX.append(dxr)
-                    DY.append(dyr)
-                    DZ.append(dzr)
-                    dxr, dyr, dzr = [], [], []
-
-        # Progress update
-        progress = ((i + 1) / n_batches) * 100
-        print(f'{progress:.2f}% done')
-
-    # Save results after processing all tiles
-    res = np.stack([X, Y, dx, dy, dz], axis=1)
-    sname = f'{config.output_basename}_{window_size}_{step_size}.txt'
-    np.savetxt(sname, res, delimiter=' ', fmt='%.3f')
-    return res, np.stack([DX, DY, DZ], axis=2)
+def _to_shared(arr):
+    shm = shared_memory.SharedMemory(create=True, size=max(arr.nbytes, 1))
+    np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)[:] = arr
+    return shm
 
 
 
-
-
-
-def run_transicp_parallel_old2(pre_event, pos_event, config):
-    cpu_cores = os.cpu_count() * 10
-    
-    if config.method == 'translation_only':
-            
-        # ICP window and step sizes
-        window_size = config.window_size
-        step_size = config.step_size
-        margin = config.margin
-        bounds = config.bounds
-        
-
-        calc_normal = not config.has_normal_post
-        classes = config.classes
-        
-        
-        # Variables to hold the ICP vector origins (X, Y) and displacements (dx, dy)
-        X, Y = [], []
-        dx, dy, dz = [], [], []
-        DX, DY, DZ = [], [], []
-        dxr, dyr, dzr = [], [], []
-        RMSE, fitn = [], []
-    
-
-    # Load point cloud data
-    A, N = get_ept_file(pos_event, get_normal=True, calc_normal=calc_normal, cl=classes)
-    B = get_ept_file(pre_event, get_normal=False, calc_normal=calc_normal, cl=classes)
-    
-    
-    # Generate coordinate grid
-    x_min, x_max, y_min, y_max = bounds
-    xx = np.arange(x_min, x_max, step_size)
-    yy = np.arange(y_min, y_max, step_size)
-    llx, lly = np.meshgrid(xx, yy)
-    x = llx.ravel()
-    y = lly.ravel()
-    
-    total_x_steps = len(xx)
-    total_y_steps = len(yy)
-    n_process = np.ceil((total_x_steps * total_y_steps) / cpu_cores)
-    blocks = []
-    per_row = 0
-    
-    
-    for i in range(int(n_process)):
-
-        for j in range(cpu_cores*i, cpu_cores*(i+1)):
-            Xb, Xa, Na = extract_tile(x[j], y[j], step_size, margin, B, A, N)
-            blocks.append([Xb, Xa, Na, config, x[j], y[j]])
-            
-        if len(blocks) == cpu_cores:
-            results = [None] * len(blocks)
-
-            with ThreadPoolExecutor() as executor:
-                futures = {executor.submit(transicp, *block): idx for idx, block in enumerate(blocks)}
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    results[idx] = future.result()  # Place each result in the correct index
-                
-                for res in results:
-                    dx.append(res[0][0])
-                    dy.append(res[0][1])
-                    dz.append(res[0][2])
-                    dxr.append(res[0][0])
-                    dyr.append(res[0][1])
-                    dzr.append(res[0][2])
-                    X.append(res[3] + window_size/2)
-                    Y.append(res[4] + window_size/2)
-                    per_row += 1
-                    if per_row == total_x_steps:
-                        DX.append(dxr)
-                        DY.append(dyr)
-                        DZ.append(dzr)
-                        dxr, dyr, dzr = [], [], []
-                        per_row = 0
-                    
-            blocks = []
-            results.clear()
-
-
-            progress = (i / n_process) * 100
-            print('{:.2f}% done'.format(progress))
-    
-    
-    
-    res = np.stack([X, Y, dx, dy, dz], axis = 1)
-    sname = '{0}_{1}_{2}.txt'.format(config.output_basename, window_size, step_size)
-    np.savetxt(sname, res, delimiter=' ', fmt='%.3f')
-    return res, np.stack([DX, DY, DZ], axis = 2)
-
-
-
-
-
-def run_transicp_parallel_old(pre_event, pos_event, config):
-    cpu_cores = os.cpu_count()
-    
-    if config.method == 'translation_only':
-            
-        # ICP window and step sizes
-        window_size = config.window_size
-        step_size = config.step_size
-        margin = config.margin
-        bounds = config.bounds
-        
-
-        calc_normal = not config.has_normal_post
-        classes = config.classes
-        
-        
-        # Variables to hold the ICP vector origins (X, Y) and displacements (dx, dy)
-        X, Y = [], []
-        dx, dy, dz = [], [], []
-        DX, DY, DZ = [], [], []
-        dxr, dyr, dzr = [], [], []
-        RMSE, fitn = [], []
-    
-    total_x_steps = ((bounds[1] - bounds[0]) // step_size) + 1
-    total_y_steps = ((bounds[3] - bounds[2]) // step_size) + 1
-    n_process = np.ceil((total_x_steps * total_y_steps) / cpu_cores)
-    i = 0
-    blocks = []
-    per_row = 0
-    
-    for y in range(bounds[2], bounds[3], step_size):
-        for x in range(bounds[0], bounds[1], step_size):
-            
-            Xa, Na = get_pos_event(pos_event, x, y, margin, window_size, calc_normal, classes)
-            Xb = get_pre_event(pre_event, x, y, window_size, classes)
-
-            
-            if len(blocks) < cpu_cores:
-                blocks.append([Xb, Xa, Na, config, x, y])
-            if len(blocks) == cpu_cores:
-                results = [None] * len(blocks)
-                i += 1
-                with ThreadPoolExecutor() as executor:
-                    # futures = [executor.submit(transicp, *block) for block in blocks]
-                    futures = {executor.submit(transicp, *block): idx for idx, block in enumerate(blocks)}
-                    for future in as_completed(futures):
-                        # results.append(future.result())
-                        idx = futures[future]
-                        results[idx] = future.result()  # Place each result in the correct index
-                    
-                    for res in results:
-                        dx.append(res[0][0])
-                        dy.append(res[0][1])
-                        dz.append(res[0][2])
-                        dxr.append(res[0][0])
-                        dyr.append(res[0][1])
-                        dzr.append(res[0][2])
-                        X.append(res[3] + window_size/2)
-                        Y.append(res[4] + window_size/2)
-                        per_row += 1
-                        if per_row == total_x_steps:
-                            DX.append(dxr)
-                            DY.append(dyr)
-                            DZ.append(dzr)
-                            dxr, dyr, dzr = [], [], []
-                            per_row = 0
-                        
-                blocks = []
-
-
-                progress = (i / n_process) * 100
-                print('{:.2f}% done'.format(progress))
-    
-    
-    
-    res = np.stack([X, Y, dx, dy, dz], axis = 1)
-    sname = '{0}_{1}_{2}.txt'.format(config.output_basename, window_size, step_size)
-    np.savetxt(sname, res, delimiter=' ', fmt='%.3f')
-    return res, np.stack([DX, DY, DZ], axis = 2)
-
-
-
-
-
-def run_transicp(pre_event, pos_event, config):
-    
-    if config.method == 'translation_only':
-            
-        # ICP window and step sizes
-        window_size = config.window_size
-        step_size = config.step_size
-        margin = config.margin
-        bounds = config.bounds
-        calc_normal = not config.has_normal_post
-        classes = config.classes
-        
-        
-        # Variables to hold the ICP vector origins (X, Y) and displacements (dx, dy)
-        X, Y = [], []
-        dx, dy, dz = [], [], []
-        DX, DY, DZ = [], [], []
-        RMSE, fitn = [], []
-    
-    
-    total_y_steps = ((bounds[3] - bounds[2]) // step_size) + 1
-    
-    for i, y in enumerate(range(bounds[2], bounds[3], step_size)):
-        dxr, dyr, dzr = [], [], []
-        for x in range(bounds[0], bounds[1], step_size):
-            
-            Xa, Na = get_pos_event(pos_event, x, y, margin, window_size, calc_normal, classes)
-            Xb = get_pre_event(pre_event, x, y, window_size, classes)
-
-                       
-            
-            res1, rmse, Max = transicp(Xb, Xa, Na, config)
-            dx.append(res1[0])
-            dy.append(res1[1])
-            dz.append(res1[2])
-            dxr.append(res1[0])
-            dyr.append(res1[1])
-            dzr.append(res1[2])
-            
-            # RMSE.append(rmse)
-            # fitn.append(registration_icp.fitness)
-    
-            X.append(x + window_size/2)
-            Y.append(y + window_size/2)
-                
-                
-        DX.append(dxr)
-        DY.append(dyr)
-        DZ.append(dzr)
-        progress = ((i + 1) / total_y_steps) * 100
-        print('{:.2f}% done'.format(progress))
-    
-    
-    
-    res = np.stack([X, Y, dx, dy, dz], axis = 1)
-    sname = '{0}_{1}_{2}.txt'.format(config.output_basename, window_size, step_size)
-    np.savetxt(sname, res, delimiter=' ', fmt='%.3f')
-    return res, np.stack([DX, DY, DZ], axis = 2)
-    
-    
- 
-    
-
-def get_ept_file(file, get_normal, calc_normal, cl):
-    C = ['Classification[{}:{}]'.format(c, c) for c in cl]
-    classes = ','.join(C)
-    
-    if file.endswith('json'):
-        reader = 'readers.ept'
-    elif file.endswith('laz'):
-        reader = 'readers.las'
-
-
-    if calc_normal:
-        pipeline = [
-            {
-                'type':reader,
-                'filename':file
-            },
-            {
-                "type":"filters.range",
-                "limits":classes
-            },
-            {
-                "type": "filters.normal",  # Compute normals if missing
-                "knn": 8                    # Number of neighbors for normal estimation
-            }
-        ] 
-    
+def make_grid(before, after, config):
+    """ Lower-left corners of all windows (xs, ys). """
+    if config.bounds is not None:
+        x_min, x_max, y_min, y_max = config.bounds
     else:
-        pipeline = [
-            {
-                'type':reader,
-                'filename':file
-            },
-            {
-                "type":"filters.range",
-                "limits":classes
-            }
-        ]
+        # Overlap of the two clouds, windows outside it cannot be solved anyway
+        x_min = np.floor(max(before[:, 0].min(), after[:, 0].min()))
+        x_max = np.ceil(min(before[:, 0].max(), after[:, 0].max()))
+        y_min = np.floor(max(before[:, 1].min(), after[:, 1].min()))
+        y_max = np.ceil(min(before[:, 1].max(), after[:, 1].max()))
+
+    xs = np.arange(x_min, x_max - config.window_size + 1e-6, config.step_size)
+    ys = np.arange(y_min, y_max - config.window_size + 1e-6, config.step_size)
+    if len(xs) == 0 or len(ys) == 0:
+        raise ValueError('The overlapping area is smaller than one window. '
+                         'Check the input files or use a smaller window_size.')
+    return xs, ys
 
 
-    P = pdal.Pipeline(json.dumps(pipeline))
-    P.execute()
-    
-    try:
-        p = P.arrays[0]
-        XYZ = np.stack([p['X'], p['Y'], p['Z']], axis = 1)
-        if get_normal:
-            N   = np.stack([p['NormalX'], p['NormalY'], p['NormalZ']], axis = 1)
-            return XYZ, N
-        else:
-            return XYZ
-    except:
-        return None, None
-    
-    
-    
-    
-    
-def get_pos_event(file, x, y, margin, window_size, calc_normal, cl):
-    if file.endswith('json'):
-        reader = 'readers.ept'
-    elif file.endswith('laz'):
-        reader = 'readers.las'
-        
-        
-    C = ['Classification[{}:{}]'.format(c, c) for c in cl]
-    classes = ','.join(C)
-    if calc_normal:
-        pipeline = [
-            {
-                'type':reader,
-                'filename':file,
-                'bounds':'([{},{}],[{},{}])'.format(x - margin, x + window_size + margin, y - margin, y + window_size + margin)
-            },
-            {
-                "type":"filters.range",
-                "limits":classes
-            },
-            {
-                "type": "filters.normal",  # Compute normals if missing
-                "knn": 8                    # Number of neighbors for normal estimation
-            }
-        ] 
-    
+
+def run_ticp(before, after, normals, config):
+    """
+    Moving-window TICP over two point clouds that are already in memory.
+
+    Parameters
+    ----------
+    before : numpy array n x 3, pre-event points (moving)
+    after : numpy array m x 3, post-event points (fixed)
+    normals : numpy array m x 3, normals of the post-event points
+    config : ICPConfig
+
+    Returns
+    -------
+    result : dict with
+        'x', 'y'  : 1D arrays with the window centers along X and Y
+        'dx', 'dy', 'dz', 'rmse', 'n_points' : 2D grids of size len(y) x len(x),
+                    row 0 is the southern-most row
+    """
+    xs, ys = make_grid(before, after, config)
+    n_workers = config.n_workers or max(1, (os.cpu_count() or 2) - 1)
+    print(f'{len(xs)} x {len(ys)} = {len(xs) * len(ys)} windows, using {n_workers} process(es)')
+
+    # Sort by X so each column can be found with a binary search
+    order = np.argsort(before[:, 0], kind='stable')
+    before = np.ascontiguousarray(before[order])
+    order = np.argsort(after[:, 0], kind='stable')
+    after = np.ascontiguousarray(after[order])
+    normals = np.ascontiguousarray(normals[order])
+
+    grids = {k: np.full((len(ys), len(xs)), np.nan) for k in ['dx', 'dy', 'dz', 'rmse', 'n_points']}
+
+    def store(rows):
+        for row, col, dx, dy, dz, rmse, n in rows:
+            grids['dx'][row, col] = dx
+            grids['dy'][row, col] = dy
+            grids['dz'][row, col] = dz
+            grids['rmse'][row, col] = rmse
+            grids['n_points'][row, col] = n
+
+    st = time.time()
+    last = 0
+    if n_workers == 1:
+        _set_data(before, after, normals, xs, ys, config)
+        for col in range(len(xs)):
+            store(process_column(col))
+            last = _progress(col + 1, len(xs), last)
     else:
-        pipeline = [
-            {
-                'type':reader,
-                'filename':file,
-                'bounds':'([{},{}],[{},{}])'.format(x - margin, x + window_size + margin, y - margin, y + window_size + margin)
-            },
-            {
-                "type":"filters.range",
-                "limits":classes
-            }
-        ]
+        shms = {name: _to_shared(arr) for name, arr in
+                [('before', before), ('after', after), ('normals', normals)]}
+        specs = {name: (shms[name].name, arr.shape, arr.dtype) for name, arr in
+                 [('before', before), ('after', after), ('normals', normals)]}
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker,
+                                     initargs=(specs, xs, ys, config)) as executor:
+                futures = [executor.submit(process_column, col) for col in range(len(xs))]
+                for done, future in enumerate(as_completed(futures), start=1):
+                    store(future.result())
+                    last = _progress(done, len(xs), last)
+        finally:
+            for shm in shms.values():
+                shm.close()
+                shm.unlink()
 
+    et = time.time() - st
+    print(f'ICP of all windows took {int(et // 60)} min {et % 60:.1f} s')
 
-    P = pdal.Pipeline(json.dumps(pipeline))
-    P.execute()
-    
-    try:
-        p = P.arrays[0]
-        XYZ = np.stack([p['X'], p['Y'], p['Z']], axis = 1)
-        N   = np.stack([p['NormalX'], p['NormalY'], p['NormalZ']], axis = 1)
-        return XYZ, N
-    except:
-        return None, None
-
-
-
-
-def get_pre_event(file, x, y, window_size, cl):
-    if file.endswith('json'):
-        reader = 'readers.ept'
-    elif file.endswith('laz'):
-        reader = 'readers.las'
-        
-    C = ['Classification[{}:{}]'.format(c, c) for c in cl]
-    classes = ','.join(C)
-    
-    pipeline = [
-        {
-            'type':reader,
-            'filename':file,
-            'bounds':'([{},{}],[{},{}])'.format(x, x + window_size, y, y + window_size)
-        },
-        {
-            "type":"filters.range",
-            "limits":classes
-        }
-    ]
-
-    P = pdal.Pipeline(json.dumps(pipeline))
-    P.execute()
-    try:
-        p = P.arrays[0]
-        return np.stack([p['X'], p['Y'], p['Z']], axis = 1)
-    except:
-        return None
+    result = {'x': xs + config.window_size / 2, 'y': ys + config.window_size / 2}
+    result.update(grids)
+    return result
 
 
 
-
-
-''' -------------------------------------------------------------------------------------------------------------------- '''
-''' -------------------------------------------------------------------------------------------------------------------- '''
-''' -------------------------------------------------------------------------------------------------------------------- '''
-''' -------------------------------------------------------------------------------------------------------------------- '''
-''' -------------------------------------------------------------------------------------------------------------------- '''
-''' -------------------------------------------------------------------------------------------------------------------- '''
-''' -------------------------------------------------------------------------------------------------------------------- '''
-''' -------------------------------------------------------------------------------------------------------------------- '''
-
-def pdal_icp(pre_event, pos_event, config):
-    
-    X, Y = [], []
-    dx, dy, dz = [], [], []
-    DX, DY, DZ = [], [], []
-    window_size = config.window_size
-    step_size = config.step_size
-    bounds = config.bounds
-    
-    
-    for y in range(bounds[2], bounds[3], step_size):
-        dxr, dyr, dzr = [], [], []
-        for x in range(bounds[0], bounds[1], step_size):
-    
-            # PDAL pipeline with data bounds set according to the current window.
-            # The first window is 'fixed'; The second window is 'moving'.
-            # Note that we pad the 'fixed' window so the second window has room to
-            # move within the fixed window as the ICP solution converges.
-            pipeline = [
-                {
-                    'type':'readers.ept',
-                    'filename':pos_event,
-                    'bounds':'([{},{}],[{},{}])'.format(x - 2,
-                                                        x + window_size + 2,
-                                                        y - 2,
-                                                        y + window_size + 2)
-                },
-                {
-                    'type':'readers.ept',
-                    'filename':pre_event,
-                    'bounds':'([{},{}],[{},{}])'.format(x,
-                                                        x + window_size,
-                                                        y,
-                                                        y + window_size)
-                },
-                {
-                    'type':'filters.icp'
-                }
-            ]
-    
-            # Execute the pipeline
-            p = pdal.Pipeline(json.dumps(pipeline))
-            p.execute()
-    
-            # Capture the metadata, which contains the ICP transformation
-            m = p.metadata
-            t = m.get('metadata').get('filters.icp').get('transform')
-    
-            # Store vector origin and ICP-derived displacement
-            try:
-                t = [float(val) for val in t.split()]
-                X.append(x + window_size/2)
-                Y.append(y + window_size/2)
-                dxr.append(t[3])
-                dyr.append(t[7])
-                dzr.append(t[11])
-                
-                dx.append(t[3])
-                dy.append(t[7])
-                dz.append(t[11])
-            except:
-                dxr.append(0)
-                dyr.append(0)
-                dzr.append(0)
-    
-            
-        DX.append(dxr)
-        DY.append(dyr)
-        DZ.append(dzr)
-        print('{}% done'.format(np.ceil(y / (bounds[3] - bounds[2]) * 100)))
-        return (DX, DY, DZ)
-    
-
-
-
-
+def _progress(done, total, last):
+    """ Prints the progress roughly every 5%. """
+    pct = int(100 * done / total)
+    if pct >= last + 5 or done == total:
+        print(f'{pct}% done')
+        return pct
+    return last

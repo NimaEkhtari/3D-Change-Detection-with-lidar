@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Spyder / IDEs
+.spyproject/
+.vscode/
+.idea/
+
+# Data and results (keep them out of the repo)
+results/
+*.las
+*.laz
+*.tif
+*.tif.aux.xml
+*.kml

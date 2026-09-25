@@ -3,203 +3,124 @@
 Created on Thu Oct 24 14:56:16 2024
 
 @author: nekhtari
+
+Runs the moving-window translation-only ICP between two (or more) lidar point
+clouds and writes dx, dy, dz as a text file and a GeoTIFF.
+
+From Spyder or any IDE: set the parameters below and run the file.
+From a terminal:        python main.py before.laz after.laz --window 150 --step 25
+                        (python main.py --help lists all options)
+Values given on the command line override the ones set below.
 """
+
+import os
 import time
-import numpy as np
-import pdal
-import json
+import argparse
 import icp
 import utilities
-import matplotlib.pyplot as plt
-import numpy.ma as ma
 
 
-operation = 'ticp'
-# Path to pre- and post-event indexed point clouds (EPT)
-# pre_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20240906\ModelKey\ept.json'
-# pos_event = r'D:\Working\SCE\Landslide\Data\KlondikeCanyon\Entwine\20241018\ModelKey\ept.json'
+''' ------------------------ Set the following parameters ------------------------ '''
+# Point clouds in time order. With more than two, every consecutive pair is
+# processed (1 -> 2, 2 -> 3, ...). LAS/LAZ, or ept.json if PDAL is installed.
+POINT_CLOUDS = [
+    r'D:\SCE\Data\LAZ_Classified\Klondike_LAS_20240925_ModelKey_Bldgs_V2.laz',
+    r'D:\SCE\Data\LAZ_Classified\Klondike_LAS_20241018_ModelKey_Bldgs_V2.laz',
+]
+OUTPUT_DIR = 'results'
+OUTPUT_PREFIX = 'ticp_'       # outputs are named <prefix><before>_to_<after>_<window>_<step>
 
-pre_event = r'D:\Working\SCE\Landslide\Data\RollingHills\Data\RH_1018_combined.laz'
-pos_event = r'D:\Working\SCE\Landslide\Data\RollingHills\Data\RH_1023_combined.laz'
+WINDOW_SIZE = 150             # ICP window size, in the units of the point clouds
+STEP_SIZE = 25                # spacing of the windows = pixel size of the output raster
+MARGIN = 3                    # extra buffer around the post-event window
+CLASSES = [2, 6, 8]           # LAS classes to use. None = all points
 
-bounds_pre, has_normals_pre = utilities.get_metadata(pre_event)
-bounds_pos, has_normals_pos = utilities.get_metadata(pos_event)
-
-bounds = []
-bounds.append(int(min(bounds_pre[0], bounds_pos[0])))
-bounds.append(int(max(bounds_pre[1], bounds_pos[1])))
-bounds.append(int(min(bounds_pre[2], bounds_pos[2])))
-bounds.append(int(max(bounds_pre[3], bounds_pos[3])))
-
-
-
-operation = 'translation_only'
-classes = [6, 8]
-
-# bounds = [6451884, 6452800, 1726600, 1727600]
-# has_normals_pos = False
-
-start_time = time.time()
-
-
-if operation == 'translation_only':
-    configs = {
-    'classes': classes,
-    'bounds' : bounds,
-    'method' : 'translation_only',
-    'threshold' : 20,
-    'window_size' : 150,
-    'step_size' : 25,
-    'margin': 15,
-    'min_points' : 20,
-    'Tconverge' : 0.0005,
-    'Tmax_iter' : 20,
-    'outlier_threshold': 3,
-    'has_normal_post' : has_normals_pos,
-    'null': -99,
-    'output_basename' : 'trans_icp_results_0906_0925¥'
-    }
-
-    config = icp.icp_configs(configs)
-    res, disp = icp.run_transicp_parallel(pre_event, pos_event, config)
-
-end_time = time.time()
-elapsed_time = end_time - start_time
-print(f"Elapsed time: {elapsed_time:.2f} seconds")
-
-''' ------------------------------------------------------------------------------------- '''
-'''                          Plotting -------------- '''
-
-# # Calculate the length of each displacement vector
-# d = np.linalg.norm(res[:, 2:4], axis=1)
-
-# # Filter out displacements longer than 1 meter
-# mask = d <= 2.0
-# filtered_X = res[mask, 0]
-# filtered_Y = res[mask, 1]
-# filtered_delta_X = res[mask, 2]
-# filtered_delta_Y = res[mask, 3]
-
-# # Plot the ICP vectors
-# plt.figure()
-# plt.quiver(filtered_X, filtered_Y, filtered_delta_X, filtered_delta_Y, angles='xy',
-#            scale_units='xy', headwidth=2.5, headlength=4)
-# plt.axis('equal')
-# plt.show()
+MIN_POINTS = 20
+CONVERGENCE = 0.0005
+MAX_ITER = 20
+OUTLIER_THRESHOLD = 3         # in multiples of the MAD of the residuals
+NORMAL_KNN = 8
+BOUNDS = None                 # [xmin, xmax, ymin, ymax] to process only part of the area
+N_WORKERS = None              # None = all cores but one. Use 1 to debug in the IDE
+CRS = None                    # e.g. 'EPSG:6424' if the point clouds have no CRS stored
+PLOT = False                  # True = quick plot of the results at the end (handy in Spyder)
+''' ------------------------------------------------------------------------------ '''
 
 
 
-
-
-def plot_all(res, disp, Th):
-    
-    # Calculate dh and apply filtering
-    dx, dy, dz = disp[:, :, 0], disp[:, :, 1], disp[:, :, 2]
-    dh = np.sqrt(dx**2 + dy**2)
-    
-    # Set dx, dy, dz values to -99 where dh > 2.5 meters
-    dx[dh > Th] = -99
-    dy[dh > Th] = -99
-    dz[dh > Th] = -99
-    
-    # Mask the -99 values
-    dx = ma.masked_equal(dx, -99)
-    dy= ma.masked_equal(dy, -99)
-    dz = ma.masked_equal(dz, -99)
-    
-    
-    # Set up a 2x2 subplot grid
-    fig, axs = plt.subplots(2, 2, figsize=(10, 8))
-    
-    # Plot dx raster
-    cax1 = axs[0, 0].imshow(dx, cmap='viridis', origin='lower')
-    axs[0, 0].set_title('dx across area')
-    fig.colorbar(cax1, ax=axs[0, 0])
-    
-    # Plot dy raster
-    cax2 = axs[0, 1].imshow(dy, cmap='viridis', origin='lower')
-    axs[0, 1].set_title('dy across area')
-    fig.colorbar(cax2, ax=axs[0, 1])
-    
-    # Plot dz raster
-    cax3 = axs[1, 0].imshow(dz, cmap='viridis', origin='lower')
-    axs[1, 0].set_title('dz across area')
-    fig.colorbar(cax3, ax=axs[1, 0])
-    
-    
-    
-    
-    # Calculate the length of each displacement vector
-    d = np.linalg.norm(res[:, 2:4], axis=1)
-
-    # Filter out displacements longer than 1 meter
-    mask = d <= Th
-    filtered_X = res[mask, 0]
-    filtered_Y = res[mask, 1]
-    filtered_delta_X = res[mask, 2]
-    filtered_delta_Y = res[mask, 3]
-    
-    # Plot quiver plot in the fourth subplot
-    axs[1, 1].quiver(filtered_X, filtered_Y, filtered_delta_X, filtered_delta_Y, angles='xy',
-               scale_units='xy', cmap='viridis', headwidth=2.5, headlength=4)
-    axs[1, 1].set_title('Displacement vectors (filtered)')
-    
-    plt.tight_layout()
-    plt.show()
-
-
-plot_all(res, disp, 3)
+def parse_args():
+    p = argparse.ArgumentParser(description='Moving-window translation-only ICP for 3D change detection.')
+    p.add_argument('point_clouds', nargs='*', default=POINT_CLOUDS,
+                   help='two or more point clouds in time order')
+    p.add_argument('--out-dir', default=OUTPUT_DIR)
+    p.add_argument('--prefix', default=OUTPUT_PREFIX)
+    p.add_argument('--window', type=float, default=WINDOW_SIZE, help='window size')
+    p.add_argument('--step', type=float, default=STEP_SIZE, help='step between windows')
+    p.add_argument('--margin', type=float, default=MARGIN)
+    p.add_argument('--classes', type=int, nargs='*', default=CLASSES,
+                   help='LAS classes to use, e.g. --classes 2 6 (just --classes = all points)')
+    p.add_argument('--min-points', type=int, default=MIN_POINTS)
+    p.add_argument('--convergence', type=float, default=CONVERGENCE)
+    p.add_argument('--max-iter', type=int, default=MAX_ITER)
+    p.add_argument('--outlier-threshold', type=float, default=OUTLIER_THRESHOLD)
+    p.add_argument('--normal-knn', type=int, default=NORMAL_KNN)
+    p.add_argument('--bounds', type=float, nargs=4, default=BOUNDS,
+                   metavar=('XMIN', 'XMAX', 'YMIN', 'YMAX'))
+    p.add_argument('--workers', type=int, default=N_WORKERS)
+    p.add_argument('--crs', default=CRS)
+    p.add_argument('--plot', action=argparse.BooleanOptionalAction, default=PLOT)
+    return p.parse_args()
 
 
 
+def fmt(v):
+    """ 150.0 -> '150', 2.5 -> '2.5' for the file names """
+    return f'{v:g}'
 
 
 
+if __name__ == '__main__':
+    args = parse_args()
+    if len(args.point_clouds) < 2:
+        raise SystemExit('Need at least two point clouds (before and after)')
 
-import rasterio
-from rasterio.transform import from_origin
+    config = icp.ICPConfig(
+        window_size=args.window,
+        step_size=args.step,
+        margin=args.margin,
+        classes=args.classes or None,
+        min_points=args.min_points,
+        convergence=args.convergence,
+        max_iter=args.max_iter,
+        outlier_threshold=args.outlier_threshold,
+        normal_knn=args.normal_knn,
+        bounds=args.bounds,
+        n_workers=args.workers,
+        crs=args.crs,
+    )
+    os.makedirs(args.out_dir, exist_ok=True)
 
-def write_disp_rasters(disp, output_file, transform, crs="EPSG:6424"):
-    # Extract dx, dy, dz from the disp matrix
-    dx, dy, dz = disp[:, :, 0], disp[:, :, 1], disp[:, :, 2]
+    events = args.point_clouds
+    for i in range(len(events) - 1):
+        pre_event, pos_event = events[i], events[i + 1]
+        print(f'\n{pre_event}\n  -> {pos_event}')
+        start_time = time.time()
 
-    # Set up metadata for the GeoTIFF
-    height, width = dx.shape
-    metadata = {
-        'driver': 'GTiff',
-        'dtype': 'float32',
-        'count': 3,  # Three bands for dx, dy, dz
-        'width': width,
-        'height': height,
-        'crs': crs,  # Set CRS to EPSG:6424
-        'transform': transform  # Affine transform
-    }
+        print('Reading point clouds ...')
+        before, _ = utilities.read_point_cloud(pre_event, config.classes)
+        after, normals = utilities.read_point_cloud(pos_event, config.classes)
+        print(f'{len(before):,} pre-event and {len(after):,} post-event points')
+        if normals is None:
+            print('Computing normals of the post-event points ...')
+            normals = utilities.compute_normals(after, config.normal_knn)
 
-    # Write the three bands to a GeoTIFF
-    with rasterio.open(output_file, 'w', **metadata) as dst:
-        dst.write(dx, 1)  # Write dx as the first band
-        dst.write(dy, 2)  # Write dy as the second band
-        dst.write(dz, 3)  # Write dz as the third band
+        result = icp.run_ticp(before, after, normals, config)
 
-    print(f"Raster written to {output_file} with CRS {crs}")
+        name = (f'{args.prefix}{utilities.name_of(pre_event)}_to_{utilities.name_of(pos_event)}'
+                f'_{fmt(config.window_size)}_{fmt(config.step_size)}')
+        crs = config.crs or utilities.get_crs(pos_event)
+        utilities.write_results(result, os.path.join(args.out_dir, name), config.step_size, crs)
 
-# Example usage
-# Assume the disp matrix and the upper-left corner coordinates and pixel size are known
-
-transform = from_origin(min(res[:, 0]), max(res[:, 1]), configs['step_size'], configs['step_size'])  # Replace with your actual top-left coordinates and pixel size
-
-filename = f'{configs['output_basename']}_{configs['window_size']}_{configs['step_size']}.tif'
-write_disp_rasters(np.flipud(disp), filename, transform)
-
-
-
-
-
-
-
-
-
-
-
-
-
+        print(f'Elapsed time: {time.time() - start_time:.1f} seconds')
+        if args.plot:
+            utilities.plot_all(result)
