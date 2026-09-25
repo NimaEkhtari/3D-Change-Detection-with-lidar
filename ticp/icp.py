@@ -16,11 +16,19 @@ process can cut its own tiles without copying the full clouds around.
 
 import os
 import time
+import logging
 import numpy as np
 from dataclasses import dataclass
 from scipy.spatial import KDTree
 from multiprocessing import shared_memory
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+log = logging.getLogger(__name__)
+
+
+
+class TICPCancelled(Exception):
+    """ Raised when a run is stopped through the cancel event. """
 
 
 
@@ -196,7 +204,7 @@ def make_grid(before, after, config):
 
 
 
-def run_ticp(before, after, normals, config):
+def run_ticp(before, after, normals, config, progress=None, cancel=None):
     """
     Moving-window TICP over two point clouds that are already in memory.
 
@@ -206,6 +214,10 @@ def run_ticp(before, after, normals, config):
     after : numpy array m x 3, post-event points (fixed)
     normals : numpy array m x 3, normals of the post-event points
     config : ICPConfig
+    progress : optional function progress(fraction, message), called after
+        every column of windows with fraction going from 0 to 1
+    cancel : optional threading.Event (or anything with is_set()). When it is
+        set the run stops and TICPCancelled is raised
 
     Returns
     -------
@@ -216,7 +228,14 @@ def run_ticp(before, after, normals, config):
     """
     xs, ys = make_grid(before, after, config)
     n_workers = config.n_workers or max(1, (os.cpu_count() or 2) - 1)
-    print(f'{len(xs)} x {len(ys)} = {len(xs) * len(ys)} windows, using {n_workers} process(es)')
+    log.info(f'{len(xs)} x {len(ys)} = {len(xs) * len(ys)} windows, using {n_workers} process(es)')
+
+    def report(done):
+        if progress is not None:
+            progress(done / len(xs), f'ICP: column {done} of {len(xs)}')
+
+    def stopped():
+        return cancel is not None and cancel.is_set()
 
     # Sort by X so each column can be found with a binary search
     order = np.argsort(before[:, 0], kind='stable')
@@ -236,12 +255,13 @@ def run_ticp(before, after, normals, config):
             grids['n_points'][row, col] = n
 
     st = time.time()
-    last = 0
     if n_workers == 1:
         _set_data(before, after, normals, xs, ys, config)
         for col in range(len(xs)):
+            if stopped():
+                raise TICPCancelled()
             store(process_column(col))
-            last = _progress(col + 1, len(xs), last)
+            report(col + 1)
     else:
         shms = {name: _to_shared(arr) for name, arr in
                 [('before', before), ('after', after), ('normals', normals)]}
@@ -252,26 +272,20 @@ def run_ticp(before, after, normals, config):
                                      initargs=(specs, xs, ys, config)) as executor:
                 futures = [executor.submit(process_column, col) for col in range(len(xs))]
                 for done, future in enumerate(as_completed(futures), start=1):
+                    if stopped():
+                        # drop the columns that did not start yet, the running ones finish quickly
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise TICPCancelled()
                     store(future.result())
-                    last = _progress(done, len(xs), last)
+                    report(done)
         finally:
             for shm in shms.values():
                 shm.close()
                 shm.unlink()
 
     et = time.time() - st
-    print(f'ICP of all windows took {int(et // 60)} min {et % 60:.1f} s')
+    log.info(f'ICP of all windows took {int(et // 60)} min {et % 60:.1f} s')
 
     result = {'x': xs + config.window_size / 2, 'y': ys + config.window_size / 2}
     result.update(grids)
     return result
-
-
-
-def _progress(done, total, last):
-    """ Prints the progress roughly every 5%. """
-    pct = int(100 * done / total)
-    if pct >= last + 5 or done == total:
-        print(f'{pct}% done')
-        return pct
-    return last

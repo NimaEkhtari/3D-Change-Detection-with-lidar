@@ -9,15 +9,11 @@ clouds and writes dx, dy, dz as a text file and a GeoTIFF.
 
 From Spyder or any IDE: set the parameters below and run the file.
 From a terminal:        python main.py before.laz after.laz --window 150 --step 25
-                        (python main.py --help lists all options)
+                        (or, after pip install, just: ticp before.laz after.laz ...)
 Values given on the command line override the ones set below.
 """
 
-import os
-import time
-import argparse
-import icp
-import utilities
+from ticp import cli
 
 
 ''' ------------------------ Set the following parameters ------------------------ '''
@@ -48,79 +44,22 @@ PLOT = False                  # True = quick plot of the results at the end (han
 
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description='Moving-window translation-only ICP for 3D change detection.')
-    p.add_argument('point_clouds', nargs='*', default=POINT_CLOUDS,
-                   help='two or more point clouds in time order')
-    p.add_argument('--out-dir', default=OUTPUT_DIR)
-    p.add_argument('--prefix', default=OUTPUT_PREFIX)
-    p.add_argument('--window', type=float, default=WINDOW_SIZE, help='window size')
-    p.add_argument('--step', type=float, default=STEP_SIZE, help='step between windows')
-    p.add_argument('--margin', type=float, default=MARGIN)
-    p.add_argument('--classes', type=int, nargs='*', default=CLASSES,
-                   help='LAS classes to use, e.g. --classes 2 6 (just --classes = all points)')
-    p.add_argument('--min-points', type=int, default=MIN_POINTS)
-    p.add_argument('--convergence', type=float, default=CONVERGENCE)
-    p.add_argument('--max-iter', type=int, default=MAX_ITER)
-    p.add_argument('--outlier-threshold', type=float, default=OUTLIER_THRESHOLD)
-    p.add_argument('--normal-knn', type=int, default=NORMAL_KNN)
-    p.add_argument('--bounds', type=float, nargs=4, default=BOUNDS,
-                   metavar=('XMIN', 'XMAX', 'YMIN', 'YMAX'))
-    p.add_argument('--workers', type=int, default=N_WORKERS)
-    p.add_argument('--crs', default=CRS)
-    p.add_argument('--plot', action=argparse.BooleanOptionalAction, default=PLOT)
-    return p.parse_args()
-
-
-
-def fmt(v):
-    """ 150.0 -> '150', 2.5 -> '2.5' for the file names """
-    return f'{v:g}'
-
-
-
 if __name__ == '__main__':
-    args = parse_args()
-    if len(args.point_clouds) < 2:
-        raise SystemExit('Need at least two point clouds (before and after)')
-
-    config = icp.ICPConfig(
-        window_size=args.window,
-        step_size=args.step,
-        margin=args.margin,
-        classes=args.classes or None,
-        min_points=args.min_points,
-        convergence=args.convergence,
-        max_iter=args.max_iter,
-        outlier_threshold=args.outlier_threshold,
-        normal_knn=args.normal_knn,
-        bounds=args.bounds,
-        n_workers=args.workers,
-        crs=args.crs,
-    )
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    events = args.point_clouds
-    for i in range(len(events) - 1):
-        pre_event, pos_event = events[i], events[i + 1]
-        print(f'\n{pre_event}\n  -> {pos_event}')
-        start_time = time.time()
-
-        print('Reading point clouds ...')
-        before, _ = utilities.read_point_cloud(pre_event, config.classes)
-        after, normals = utilities.read_point_cloud(pos_event, config.classes)
-        print(f'{len(before):,} pre-event and {len(after):,} post-event points')
-        if normals is None:
-            print('Computing normals of the post-event points ...')
-            normals = utilities.compute_normals(after, config.normal_knn)
-
-        result = icp.run_ticp(before, after, normals, config)
-
-        name = (f'{args.prefix}{utilities.name_of(pre_event)}_to_{utilities.name_of(pos_event)}'
-                f'_{fmt(config.window_size)}_{fmt(config.step_size)}')
-        crs = config.crs or utilities.get_crs(pos_event)
-        utilities.write_results(result, os.path.join(args.out_dir, name), config.step_size, crs)
-
-        print(f'Elapsed time: {time.time() - start_time:.1f} seconds')
-        if args.plot:
-            utilities.plot_all(result)
+    cli.main(defaults=dict(
+        point_clouds=POINT_CLOUDS,
+        out_dir=OUTPUT_DIR,
+        prefix=OUTPUT_PREFIX,
+        window_size=WINDOW_SIZE,
+        step_size=STEP_SIZE,
+        margin=MARGIN,
+        classes=CLASSES,
+        min_points=MIN_POINTS,
+        convergence=CONVERGENCE,
+        max_iter=MAX_ITER,
+        outlier_threshold=OUTLIER_THRESHOLD,
+        normal_knn=NORMAL_KNN,
+        bounds=BOUNDS,
+        n_workers=N_WORKERS,
+        crs=CRS,
+        plot=PLOT,
+    ))

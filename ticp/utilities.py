@@ -12,8 +12,11 @@ ept.json) is handed to PDAL, which is optional and only needed for those formats
 
 import os
 import json
+import logging
 import numpy as np
 from scipy.spatial import KDTree
+
+log = logging.getLogger(__name__)
 
 
 
@@ -23,6 +26,7 @@ def read_point_cloud(file, classes=None):
     some classes. Also returns the stored normals (n x 3) if the file has
     NormalX/NormalY/NormalZ dimensions, otherwise None.
     """
+    file = os.fspath(file)
     if not os.path.exists(file):
         raise FileNotFoundError(f'Point cloud not found: {file}')
 
@@ -84,6 +88,7 @@ def compute_normals(XYZ, knn=8, chunk=1_000_000):
 
 def get_crs(file):
     """ Horizontal CRS of a point cloud as WKT, or None if it cannot be found. """
+    file = os.fspath(file)
     try:
         if file.lower().endswith(('.las', '.laz')):
             import laspy
@@ -98,13 +103,14 @@ def get_crs(file):
             with open(file) as f:
                 return json.load(f)['srs']['wkt'] or None
     except Exception as e:
-        print(f'Could not read the CRS from {file}: {e}')
+        log.warning(f'Could not read the CRS from {file}: {e}')
     return None
 
 
 
 def name_of(file):
     """ Short name of an input, for ept.json the name of its folder. """
+    file = os.fspath(file)
     if os.path.basename(file).lower() == 'ept.json':
         return os.path.basename(os.path.dirname(os.path.abspath(file)))
     return os.path.splitext(os.path.basename(file))[0]
@@ -148,34 +154,5 @@ def write_results(result, basename, step_size, crs=None):
             dst.set_band_description(i, b)
 
     if crs is None:
-        print('Warning: no CRS found, the GeoTIFF has no spatial reference. Set crs in main.py')
-    print(f'Results written to {basename}.txt and {basename}.tif')
-
-
-
-def plot_all(result, Th=None):
-    """
-    Quick look at the results: dx, dy, dz grids and the horizontal vectors.
-    Windows with a horizontal shift larger than Th are left out.
-    """
-    import matplotlib.pyplot as plt
-
-    dx, dy, dz = result['dx'].copy(), result['dy'].copy(), result['dz'].copy()
-    if Th is not None:
-        bad = np.hypot(dx, dy) > Th
-        dx[bad] = dy[bad] = dz[bad] = np.nan
-
-    extent = [result['x'][0], result['x'][-1], result['y'][0], result['y'][-1]]
-    fig, axs = plt.subplots(2, 2, figsize=(11, 9), sharex=True, sharey=True)
-    for ax, grid, title in zip(axs.flat, [dx, dy, dz], ['dx', 'dy', 'dz']):
-        lim = np.nanpercentile(np.abs(grid), 98) if np.any(np.isfinite(grid)) else 1
-        im = ax.imshow(grid, cmap='RdBu_r', vmin=-lim, vmax=lim, origin='lower', extent=extent)
-        ax.set_title(title)
-        fig.colorbar(im, ax=ax)
-
-    X, Y = np.meshgrid(result['x'], result['y'])
-    axs[1, 1].quiver(X, Y, dx, dy, angles='xy', headwidth=2.5, headlength=4)
-    axs[1, 1].set_title('Horizontal displacement')
-    axs[1, 1].set_aspect('equal')
-    plt.tight_layout()
-    plt.show()
+        log.warning('No CRS found, the GeoTIFF has no spatial reference. Set crs in the config')
+    log.info(f'Results written to {basename}.txt and {basename}.tif')

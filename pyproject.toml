@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ticp"
+dynamic = ["version"]
+description = "Moving-window translation-only ICP (TICP) for 3D change detection from repeat lidar surveys"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Nima Ekhtari" }]
+keywords = ["lidar", "point cloud", "ICP", "change detection", "landslide", "deformation"]
+dependencies = [
+    "numpy",
+    "scipy",
+    "laspy[lazrs]",
+    "rasterio",
+    "pyproj",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+kml = ["simplekml"]
+dev = ["pytest"]
+
+[project.scripts]
+ticp = "ticp.cli:main"
+ticp-plot = "ticp.plotting:main"
+ticp-remove-bias = "ticp.bias:main"
+
+[project.urls]
+Repository = "https://github.com/NimaEkhtari/3D-Change-Detection-with-lidar"
+
+[tool.setuptools]
+packages = ["ticp"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ticp.__version__" }

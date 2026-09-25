@@ -14,3 +14,9 @@ results/
 *.tif
 *.tif.aux.xml
 *.kml
+
+# Packaging and tests
+*.egg-info/
+build/
+dist/
+.pytest_cache/
